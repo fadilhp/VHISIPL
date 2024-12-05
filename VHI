@@ -1,0 +1,181 @@
+# VHISIPL
+Indeks Kesehatan Vegetasi Jawa Timur tahu 2005 - 2023
+// Memuat batas administratif Jawa Timur
+var adminBoundaries = ee.FeatureCollection("FAO/GAUL/2015/level1");
+var eastJavaBoundary = adminBoundaries.filter(
+  ee.Filter.and(
+    ee.Filter.eq('ADM0_NAME', 'Indonesia'), // Negara: Indonesia.
+    ee.Filter.eq('ADM1_NAME', 'Jawa Timur') // Provinsi: Jawa Timur.
+  )
+);
+
+// Memuat dataset NDVI dan LST dari MODIS, menentukan rentang waktu
+var time_start = '2001', time_end = '2024';
+
+var ndvi = ee.ImageCollection("MODIS/061/MOD13A2")
+  .select('NDVI')
+  .filterDate(time_start, time_end); // NDVI untuk vegetasi.
+
+var temp = ee.ImageCollection("MODIS/061/MOD11A2")
+  .select('LST_Day_1km')
+  .filterDate(time_start, time_end); // LST untuk suhu permukaan.
+
+// Menghitung NDVI minimum dan maksimum untuk Vegetation Condition Index (VCI)
+var ndvi_min = ndvi.min().multiply(0.0001); // NDVI minimum (normalisasi).
+var ndvi_max = ndvi.max().multiply(0.0001); // NDVI maksimum (normalisasi).
+
+// Fungsi untuk koleksi temporal (bulanan)
+function temporal_collection(collection, start, count, interval, unit) {
+  var seq = ee.List.sequence(0, ee.Number(count).subtract(1));
+  var origin_date = ee.Date(start);
+  return ee.ImageCollection(seq.map(function(i) {
+    var start_date = origin_date.advance(ee.Number(interval).multiply(i), unit);
+    var end_date = origin_date.advance(ee.Number(interval).multiply(ee.Number(i).add(1)), unit);
+    return collection.filterDate(start_date, end_date).mean()
+      .set('system:time_start', start_date.millis())
+      .set('system:time_end', end_date.millis());
+  }));
+}
+
+// Menghitung NDVI bulanan dan VCI
+var ndvi_monthly = temporal_collection(ndvi, time_start, 276, 1, 'month');
+var vci = ndvi_monthly.map(function(img) {
+  var index = img.expression('(ndvi - min) / (max - min)', {
+    'ndvi': img.select('NDVI').multiply(0.0001), // Normalisasi NDVI.
+    'min': ndvi_min,
+    'max': ndvi_max
+  });
+  return index.rename('VCI').copyProperties(img, img.propertyNames());
+});
+
+// Menghitung Temperature Condition Index (TCI)
+var temp_max = temp.max().multiply(0.02); // Suhu maksimum.
+var temp_min = temp.min().multiply(0.02); // Suhu minimum.
+
+var temp_monthly = temporal_collection(temp, time_start, 276, 1, 'month');
+var tci = temp_monthly.map(function(img) {
+  var index = img.expression('(max - lst)/(max - min)', {
+    'max': temp_max,
+    'min': temp_min,
+    'lst': img.multiply(0.02) // Normalisasi suhu.
+  });
+  return index.rename('TCI').copyProperties(img, img.propertyNames());
+});
+
+// Menggabungkan VCI dan TCI untuk menghitung VHI
+var modis_indices = vci.combine(tci);
+
+var drought = modis_indices.map(function(img) {
+  var vhi = img.expression('0.5 * vci + (1 - 0.5) * tci', {
+    'vci': img.select('VCI'),
+    'tci': img.select('TCI')
+  }).rename('VHI');
+  return img.addBands(vhi).copyProperties(img, img.propertyNames());
+});
+
+// Mendefinisikan layer VHI berdasarkan tahun
+var vhiImages = {
+  '2005': drought.select('VHI').filterDate('2005', '2006').mean().clip(eastJavaBoundary),
+  '2010': drought.select('VHI').filterDate('2010', '2011').mean().clip(eastJavaBoundary),
+  '2015': drought.select('VHI').filterDate('2015', '2016').mean().clip(eastJavaBoundary),
+  '2020': drought.select('VHI').filterDate('2020', '2021').mean().clip(eastJavaBoundary),
+  '2023': drought.select('VHI').filterDate('2023', '2024').mean().clip(eastJavaBoundary),
+};
+// Fungsi untuk memilih layer berdasarkan tahun
+function addLayerSelector(mapToChange, defaultValue, position) {
+  var label = ui.Label('Choose a year to visualize VHI');
+  function updateMap(selection) {
+    mapToChange.layers().set(0, ui.Map.Layer(vhiImages[selection], vhiVisParams));
+  }
+  var select = ui.Select({items: Object.keys(vhiImages), onChange: updateMap});
+  select.setValue(Object.keys(vhiImages)[defaultValue], true);
+  var controlPanel = ui.Panel({widgets: [label, select], style: {position: position}});
+  mapToChange.add(controlPanel);
+}
+
+// Membuat peta kiri dan kanan dengan tampilan satelit
+var leftMap = ui.Map();
+leftMap.setOptions('SATELLITE');
+leftMap.setControlVisibility(false);
+addLayerSelector(leftMap, 0, 'top-left');
+
+var rightMap = ui.Map();
+rightMap.setOptions('SATELLITE');
+rightMap.setControlVisibility(false);
+addLayerSelector(rightMap, 1, 'top-right');
+
+// Memusatkan peta pada wilayah Jawa Timur
+leftMap.centerObject(eastJavaBoundary, 7);
+rightMap.centerObject(eastJavaBoundary, 7);
+
+// Membuat panel split untuk membandingkan dua peta
+var splitPanel = ui.SplitPanel({
+  firstPanel: leftMap,
+  secondPanel: rightMap,
+  wipe: true,
+  style: {stretch: 'both'}
+});
+
+// Menampilkan panel split sebagai elemen utama UI
+ui.root.widgets().reset([splitPanel]);
+var linker = ui.Map.Linker([leftMap, rightMap]);
+
+// Menambahkan legenda hanya pada peta kiri
+leftMap.add(legend);
+
+// Parameter Visualisasi untuk VHI
+var vhiVisParams = {
+  min: 0,
+  max: 1,
+  palette: ['FF0000', 'FFA500', 'FFFF00', '008000', '006400'] // Palet warna dari merah (buruk) ke hijau (baik).
+};
+
+// Palet warna dan label untuk legenda
+var palette = ['FF0000', 'FFA500', 'FFFF00', '008000', '006400'];
+var labels = ['Very Low', 'Low', 'Moderate', 'High', 'Very High'];
+
+// Membuat panel untuk legenda
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left', // Posisi di pojok kiri bawah.
+    padding: '8px 15px',
+    backgroundColor: 'white' // Warna latar putih agar terlihat jelas.
+  }
+});
+
+// Menambahkan judul pada legenda
+var legendTitle = ui.Label({
+  value: 'VHI Index', // Judul legenda.
+  style: {
+    fontWeight: 'bold',
+    fontSize: '16px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+legend.add(legendTitle);
+
+// Fungsi untuk membuat baris legenda (warna dan label)
+function makeRow(color, name) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: '#' + color, // Warna kotak sesuai palet.
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+  var description = ui.Label({
+    value: name, // Label deskriptif sesuai tingkatannya.
+    style: {margin: '0 0 4px 6px'}
+  });
+
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+}
+
+// Menambahkan baris warna dan label ke legenda
+for (var i = 0; i < palette.length; i++) {
+  legend.add(makeRow(palette[i], labels[i]));
+}
